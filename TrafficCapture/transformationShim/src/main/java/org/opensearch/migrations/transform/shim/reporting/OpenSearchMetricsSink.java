@@ -20,14 +20,21 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Bulk-indexes ValidationDocuments into a reporting OpenSearch cluster.
- * Uses a synchronized buffer + background flush thread.
+ * Enhanced OpenSearch Metrics Sink that creates explicit index mappings.
+ * 
+ * Features:
+ * - Creates index template with optimized field types on initialization
+ * - Bulk-indexes ValidationDocuments with buffering
+ * - Non-blocking submission with background flush
+ * - Proper keyword types for aggregation fields
+ * - Time-series daily rolling indices
  */
 public class OpenSearchMetricsSink implements MetricsSink {
 
     private static final Logger log = LoggerFactory.getLogger(OpenSearchMetricsSink.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy.MM.dd");
+    private static final String TEMPLATE_NAME_SUFFIX = "-template";
 
     private final String reportingClusterUri;
     private final String indexPrefix;
@@ -54,9 +61,10 @@ public class OpenSearchMetricsSink implements MetricsSink {
         }
 
         var builder = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10));
-        // Note: for insecure TLS, a custom SSLContext would be needed in production.
-        // For now we rely on the default trust store or the JVM's javax.net.ssl settings.
         this.httpClient = builder.build();
+
+        // Create index template with explicit mappings on initialization
+        createIndexTemplate();
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "metrics-sink-flush");
@@ -64,6 +72,223 @@ public class OpenSearchMetricsSink implements MetricsSink {
             return t;
         });
         this.scheduler.scheduleAtFixedRate(this::flush, flushIntervalMs, flushIntervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Creates an index template with explicit field mappings.
+     * This ensures all shim-metrics-* indices have consistent, optimized mappings.
+     */
+    private void createIndexTemplate() {
+        try {
+            String templateName = indexPrefix + TEMPLATE_NAME_SUFFIX;
+            String templateJson = buildIndexTemplateJson();
+
+            var requestBuilder = HttpRequest.newBuilder()
+                    .uri(URI.create(reportingClusterUri + "/_index_template/" + templateName))
+                    .header("Content-Type", "application/json")
+                    .PUT(HttpRequest.BodyPublishers.ofString(templateJson))
+                    .timeout(Duration.ofSeconds(10));
+
+            if (authHeader != null) {
+                requestBuilder.header("Authorization", authHeader);
+            }
+
+            HttpResponse<String> response = httpClient.send(requestBuilder.build(),
+                    HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() >= 200 && response.statusCode() < 300) {
+                log.info("Successfully created index template: {} for pattern: {}-*", 
+                    templateName, indexPrefix);
+            } else {
+                log.warn("Failed to create index template '{}', status {}: {}. Will use dynamic mapping.", 
+                    templateName, response.statusCode(), truncate(response.body(), 200));
+            }
+        } catch (Exception e) {
+            log.error("Error creating index template (non-fatal, will use dynamic mapping): {}", 
+                e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Builds the index template JSON with explicit field type mappings.
+     * 
+     * Key design decisions:
+     * - keyword types for fields needing aggregation (collection_name, endpoint, request_id)
+     * - date type for timestamp (enables time-based queries)
+     * - long/double types for numeric metrics
+     * - nested type for comparisons array (enables independent element queries)
+     * - text+keyword dual indexing for URIs (searchable + aggregatable)
+     */
+    private String buildIndexTemplateJson() {
+        return String.format("""
+            {
+              "index_patterns": ["%s-*"],
+              "priority": 100,
+              "template": {
+                "settings": {
+                  "number_of_shards": 1,
+                  "number_of_replicas": 1,
+                  "refresh_interval": "5s"
+                },
+                "mappings": {
+                  "properties": {
+                    "timestamp": {
+                      "type": "date",
+                      "format": "strict_date_optional_time||epoch_millis"
+                    },
+                    "request_id": {
+                      "type": "keyword"
+                    },
+                    "collection_name": {
+                      "type": "keyword"
+                    },
+                    "normalized_endpoint": {
+                      "type": "keyword"
+                    },
+                    "solr_hit_count": {
+                      "type": "long"
+                    },
+                    "opensearch_hit_count": {
+                      "type": "long"
+                    },
+                    "hit_count_drift_percentage": {
+                      "type": "double"
+                    },
+                    "solr_qtime_ms": {
+                      "type": "long"
+                    },
+                    "opensearch_took_ms": {
+                      "type": "long"
+                    },
+                    "query_time_delta_ms": {
+                      "type": "long"
+                    },
+                    "original_request": {
+                      "properties": {
+                        "method": {
+                          "type": "keyword"
+                        },
+                        "uri": {
+                          "type": "text",
+                          "fields": {
+                            "keyword": {
+                              "type": "keyword",
+                              "ignore_above": 256
+                            }
+                          }
+                        },
+                        "headers": {
+                          "properties": {
+                            "content-length": {
+                              "type": "long"
+                            },
+                            "Accept": {
+                              "type": "keyword"
+                            },
+                            "Host": {
+                              "type": "keyword"
+                            },
+                            "User-Agent": {
+                              "type": "keyword"
+                            },
+                            "content-type": {
+                              "type": "keyword"
+                            }
+                          }
+                        },
+                        "body": {
+                          "type": "text",
+                          "index": false,
+                          "ignore_above": 2147483647
+                        }
+                      }
+                    },
+                    "transformed_request": {
+                      "properties": {
+                        "method": {
+                          "type": "keyword"
+                        },
+                        "uri": {
+                          "type": "text",
+                          "fields": {
+                            "keyword": {
+                              "type": "keyword",
+                              "ignore_above": 256
+                            }
+                          }
+                        },
+                        "headers": {
+                          "properties": {
+                            "content-length": {
+                              "type": "long"
+                            },
+                            "Accept": {
+                              "type": "keyword"
+                            },
+                            "Host": {
+                              "type": "keyword"
+                            },
+                            "User-Agent": {
+                              "type": "keyword"
+                            },
+                            "content-type": {
+                              "type": "keyword"
+                            }
+                          }
+                        },
+                        "body": {
+                          "type": "text",
+                          "index": false,
+                          "ignore_above": 2147483647
+                        }
+                      }
+                    },
+                    "comparisons": {
+                      "type": "nested",
+                      "properties": {
+                        "type": {
+                          "type": "keyword"
+                        },
+                        "name": {
+                          "type": "keyword"
+                        },
+                        "keys_match": {
+                          "type": "boolean"
+                        },
+                        "missing_keys": {
+                          "type": "keyword"
+                        },
+                        "extra_keys": {
+                          "type": "keyword"
+                        },
+                        "value_drifts": {
+                          "type": "nested",
+                          "properties": {
+                            "key": {
+                              "type": "keyword"
+                            },
+                            "solr_value": {
+                              "type": "double"
+                            },
+                            "opensearch_value": {
+                              "type": "double"
+                            },
+                            "drift_percentage": {
+                              "type": "double"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "custom_metrics": {
+                      "type": "object",
+                      "dynamic": true
+                    }
+                  }
+                }
+              }
+            }
+            """, indexPrefix);
     }
 
     @Override
@@ -108,12 +333,19 @@ public class OpenSearchMetricsSink implements MetricsSink {
         }
     }
 
+    /**
+     * Sends a batch of ValidationDocuments to OpenSearch via bulk API.
+     * Index is created automatically using the template if it doesn't exist.
+     */
     private void sendBulk(List<ValidationDocument> batch) {
         try {
             String indexName = generateIndexName();
             StringBuilder ndjson = new StringBuilder();
+            
             for (ValidationDocument doc : batch) {
+                // Action line: specifies index operation
                 ndjson.append("{\"index\":{\"_index\":\"").append(indexName).append("\"}}\n");
+                // Document line: the actual ValidationDocument as JSON
                 ndjson.append(MAPPER.writeValueAsString(doc)).append("\n");
             }
 
@@ -131,9 +363,10 @@ public class OpenSearchMetricsSink implements MetricsSink {
                     HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() >= 300) {
-                log.warn("Bulk index returned status {}: {}", response.statusCode(),
-                        truncate(response.body(), 500));
+                log.warn("Bulk index to {} returned status {}: {}", 
+                    indexName, response.statusCode(), truncate(response.body(), 500));
             } else {
+                log.debug("Successfully indexed {} documents to {}", batch.size(), indexName);
                 checkPartialFailures(response.body(), batch.size());
             }
         } catch (JsonProcessingException e) {
@@ -143,6 +376,10 @@ public class OpenSearchMetricsSink implements MetricsSink {
         }
     }
 
+    /**
+     * Checks for partial failures in bulk response.
+     * Even if HTTP status is 200, individual documents may have failed.
+     */
     private void checkPartialFailures(String responseBody, int totalDocs) {
         try {
             var tree = MAPPER.readTree(responseBody);
@@ -154,6 +391,10 @@ public class OpenSearchMetricsSink implements MetricsSink {
                         var index = item.get("index");
                         if (index != null && index.has("error")) {
                             failedCount++;
+                            if (failedCount <= 3) {  // Log first 3 errors
+                                log.warn("Document indexing error: {}", 
+                                    index.get("error").toPrettyString());
+                            }
                         }
                     }
                 }
@@ -164,6 +405,10 @@ public class OpenSearchMetricsSink implements MetricsSink {
         }
     }
 
+    /**
+     * Generates time-based index name: {prefix}-{yyyy.MM.dd}
+     * Example: shim-metrics-2025.03.17
+     */
     String generateIndexName() {
         return indexPrefix + "-" + LocalDate.now().format(DATE_FORMAT);
     }
