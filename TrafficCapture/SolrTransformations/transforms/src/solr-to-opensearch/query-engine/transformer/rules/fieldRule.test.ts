@@ -105,4 +105,81 @@ describe('fieldRule', () => {
 
     expect(spy).not.toHaveBeenCalled();
   });
+
+  // --- Field metadata (fieldMappings) ---
+
+  it('uses term query for keyword fields when fieldMappings provided', () => {
+    const node: FieldNode = { type: 'field', field: 'category', value: 'electronics' };
+    const mappings = new Map([['category', 'keyword']]);
+
+    const result = fieldRule(node, stubTransformChild, mappings);
+
+    expect(result).toEqual(
+      new Map([['term', new Map([['category', new Map([['value', 'electronics']])]])]]),
+    );
+  });
+
+  it('uses match query for text fields when fieldMappings provided', () => {
+    const node: FieldNode = { type: 'field', field: 'title', value: 'java' };
+    const mappings = new Map([['title', 'text']]);
+
+    const result = fieldRule(node, stubTransformChild, mappings);
+
+    expect(result).toEqual(
+      new Map([['match', new Map([['title', new Map([['query', 'java']])]])]]),
+    );
+  });
+
+  it('uses term query for integer fields', () => {
+    const node: FieldNode = { type: 'field', field: 'price', value: '100' };
+    const mappings = new Map([['price', 'integer']]);
+
+    const result = fieldRule(node, stubTransformChild, mappings);
+
+    expect(result).toEqual(
+      new Map([['term', new Map([['price', new Map([['value', '100']])]])]]),
+    );
+  });
+
+  it('uses term query for date fields', () => {
+    const node: FieldNode = { type: 'field', field: 'created', value: '2025-01-01' };
+    const mappings = new Map([['created', 'date']]);
+
+    const result = fieldRule(node, stubTransformChild, mappings);
+
+    expect(result).toEqual(
+      new Map([['term', new Map([['created', new Map([['value', '2025-01-01']])]])]]),
+    );
+  });
+
+  it('falls back to match query when field not in mappings', () => {
+    const node: FieldNode = { type: 'field', field: 'unknown_field', value: 'java' };
+    const mappings = new Map([['title', 'text']]);
+
+    const result = fieldRule(node, stubTransformChild, mappings);
+
+    expect(result).toEqual(
+      new Map([['match', new Map([['unknown_field', new Map([['query', 'java']])]])]]),
+    );
+  });
+
+  it('falls back to match query when fieldMappings is undefined', () => {
+    const node: FieldNode = { type: 'field', field: 'title', value: 'java' };
+
+    const result = fieldRule(node, stubTransformChild, undefined);
+
+    expect(result).toEqual(
+      new Map([['match', new Map([['title', new Map([['query', 'java']])]])]]),
+    );
+  });
+
+  it('term query output uses expanded form for boost compatibility', () => {
+    const node: FieldNode = { type: 'field', field: 'category', value: 'electronics' };
+    const mappings = new Map([['category', 'keyword']]);
+    const result = fieldRule(node, stubTransformChild, mappings);
+
+    const termMap = result.get('term') as Map<string, any>;
+    const fieldParams = termMap.get('category');
+    expect(fieldParams).toBeInstanceOf(Map);
+  });
 });

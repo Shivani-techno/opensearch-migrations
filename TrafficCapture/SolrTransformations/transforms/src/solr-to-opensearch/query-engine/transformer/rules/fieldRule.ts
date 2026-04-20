@@ -1,32 +1,22 @@
 /**
- * Transformation rule for FieldNode → OpenSearch `match` or `exists` query.
+ * Transformation rule for FieldNode → OpenSearch query.
  *
- * Maps Solr's field:value syntax to OpenSearch's match query.
- * Special case: field:* (existence search) maps to exists query.
+ * Maps Solr's field:value syntax to the appropriate OpenSearch query type:
+ *   - field:* (existence) → exists query
+ *   - field:value (keyword field) → term query (exact match)
+ *   - field:value (text field or unknown) → match query (analyzed)
  *
- * We use `match` instead of `term` because Solr's standard query parser
- * analyzes field values at query time, matching OpenSearch's match behavior.
- * Using `term` would require exact matches against the indexed tokens,
- * which could fail for analyzed fields (e.g., case differences).
- *
- * Output uses the expanded match query form with nested field object:
- *   `{"match": {"field": {"query": "value"}}}`
- * This allows boostRule to add boost inside the field object:
- *   `{"match": {"field": {"query": "value", "boost": 2}}}`
- *
- * Examples:
- *   `title:java` → Map{"match" → Map{"title" → Map{"query" → "java"}}}
- *   `title:*` → Map{"exists" → Map{"field" → "title"}}
+ * When fieldMappings are provided, the rule uses the field's OpenSearch type
+ * to choose between term (keyword/numeric/date) and match (text) queries.
+ * Without fieldMappings, defaults to match query for backward compatibility.
  *
  * Unsupported (throws error):
  *   - Wildcards (te?t, tes*) - throws error
  *   - Fuzzy searches (roam~, roam~1) - throws error
- *
- * Note: Boosts are handled separately by BoostNode.
  */
 
 import type { ASTNode } from '../../ast/nodes';
-import type { TransformRuleFn } from '../types';
+import type { TransformRuleFn, FieldMappings } from '../types';
 
 /** Regex to detect wildcard patterns (contains * or ?) */
 const WILDCARD_PATTERN = /[*?]/;
@@ -34,21 +24,22 @@ const WILDCARD_PATTERN = /[*?]/;
 /** Regex to detect fuzzy search patterns (term~ or term~N at end) */
 const FUZZY_PATTERN = /~\d?$/;
 
+/** OpenSearch field types that should use term query (exact match, not analyzed) */
+const KEYWORD_TYPES = new Set(['keyword', 'integer', 'long', 'float', 'double', 'boolean', 'date', 'ip']);
+
 export const fieldRule: TransformRuleFn = (
   node: ASTNode,
-  // Field is a leaf node — transformChild not used
   _transformChild,
+  fieldMappings?: FieldMappings,
 ): Map<string, any> => {
   const { field, value } = node;
 
   // Existence search (field:*) → exists query
-  // TODO: Add support for fuzzy queries
   if (value === '*') {
     return new Map([['exists', new Map([['field', field]])]]);
   }
 
-  // Detect unsupported fuzzy patterns (check before wildcard since ~ is more specific)
-  // TODO: Add support for wildcard queries
+  // Detect unsupported fuzzy patterns
   if (FUZZY_PATTERN.test(value)) {
     const msg = `[fieldRule] Fuzzy queries aren't supported yet. Query: ${field}:${value}`;
     console.error(msg);
@@ -56,14 +47,19 @@ export const fieldRule: TransformRuleFn = (
   }
 
   // Detect unsupported wildcard patterns
-  // TODO: Add support for wildcard queries
   if (WILDCARD_PATTERN.test(value)) {
     const msg = `[fieldRule] Wildcard queries aren't supported yet. Query: ${field}:${value}`;
     console.error(msg);
     throw new Error(msg);
   }
 
-  // Use expanded form: {"match": {"field": {"query": "value"}}}
-  // This allows boostRule to add boost inside the field object
+  // Choose query type based on field metadata
+  const fieldType = fieldMappings?.get(field);
+  if (fieldType && KEYWORD_TYPES.has(fieldType)) {
+    // Keyword/numeric/date fields → term query (exact match, no analysis)
+    return new Map([['term', new Map([[field, new Map([['value', value]])]])]]);
+  }
+
+  // Default: text fields or unknown → match query (analyzed)
   return new Map([['match', new Map([[field, new Map([['query', value]])]])]]);
 };
